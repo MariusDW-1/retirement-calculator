@@ -378,7 +378,7 @@ export default function RetirementCalculator() {
                   <div className="grid grid-cols-1 gap-3 md:grid-cols-6">
                     {field("Current Balance (R)", <input type="number" className="rounded-xl border p-2" value={p.currentBalance} onChange={e=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, currentBalance: parseNum(e.target.value)}:x)}))} />)}
                     {field("Monthly Contribution (R)", <input type="number" className="rounded-xl border p-2" value={p.monthlyContribution} onChange={e=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, monthlyContribution: parseNum(e.target.value)}:x)}))} />)}
-                    {field("Contribution Escalation (% p.a.)", <Percent value={p.annualContributionEscalation} onChange={val=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, annualContributionEscalation: val}:x)}))} />)}
+                    {field("Contribution Esc. (% p.a.)", <Percent value={p.annualContributionEscalation} onChange={val=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, annualContributionEscalation: val}:x)}))} />)}
                     {field("Return (% p.a.)", <Percent value={p.nominalReturn} onChange={val=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, nominalReturn: val}:x)}))} />)}
                     {field("Fees (TER+advice, % p.a.)", <Percent value={p.annualFees} onChange={val=>setInp(v=>({...v, products: v.products.map(x=>x.id===p.id?{...x, annualFees: val}:x)}))} />)}
                     <div className="flex flex-col justify-end"><small className="text-gray-500">Escalations apply annually.</small></div>
