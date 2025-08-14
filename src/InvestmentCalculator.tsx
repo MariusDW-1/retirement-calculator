@@ -4,20 +4,19 @@ import React, { useMemo, useState } from "react";
  * SmartPlan – Investment Calculator (South Africa)
  * React + TypeScript + Tailwind (single-file / Canvas-ready)
  *
- * Modes:
- * - Lump Sum only
- * - Lump Sum + Monthly contribution (with annual escalation)
+ * Requirements from user:
+ * - The following inputs must default to 0 on page load AND reset to 0 when "Reset" is pressed:
+ *   • Lump Sum (R)
+ *   • Monthly Contribution (R)
+ *   • Years
+ *   • Target Amount (Today’s R)
+ *   • (Lump-sum only mode) Lump Sum (R) and Years (these are the same fields; mode just hides Monthly)
  *
- * Assumptions:
+ * Notes:
  * - Monthly compounding
- * - Inflation adjustment (today’s Rand) – no tax/fees in this version
- *
- * Outputs:
- * - Line chart: Future Value over time (Nominal vs Today’s R)
- * - Bar chart: Final snapshot (Required vs Projected vs Shortfall + Lump vs Monthly)
- * - CSV export + Print/PDF + Reset
- *
- * Compliance (ZA): FSCA/FAIS/POPIA – estimates only; not financial advice.
+ * - Real values = nominal / (1+inflation)^years
+ * - No external images; CSV + Print actions included
+ * - Tailwind classes included
  */
 
 // ---------- Utilities ----------
@@ -39,7 +38,6 @@ function fvLumpMonthly(pv: number, annualR: number, months: number) {
   const i = annualR / 12;
   return pv * Math.pow(1 + i, months);
 }
-
 function fvGrowingAnnuityMonthly(
   P0Monthly: number,
   annualR: number,
@@ -64,35 +62,40 @@ type Mode = "lump" | "lump_plus_monthly";
 // ---------- Types ----------
 interface Inputs {
   mode: Mode;
+  // must default to 0 and reset to 0:
   lumpSum: number;
-  monthlyContribution: number; // used only for lump_plus_monthly
-  contribEscalationPA: number; // annual escalation for monthly contr
+  monthlyContribution: number;
   years: number;
-  nominalReturnPA: number; // expected return p.a.
-  inflationPA: number; // CPI
-  timing: Timing; // begin/end of month (for monthly contr)
+  targetAmountTodayR: number;
+  // other assumptions:
+  contribEscalationPA: number;
+  nominalReturnPA: number;
+  inflationPA: number;
+  timing: Timing;
   hasTarget: boolean;
-  targetAmountTodayR: number; // goal (today’s R)
 }
 
 function defaultInputs(): Inputs {
   return {
     mode: "lump_plus_monthly",
-    lumpSum: 250000,
-    monthlyContribution: 3000,
-    contribEscalationPA: 0.06,
-    years: 15,
-    nominalReturnPA: 0.1,
+    // >>> Defaults requested as 0 <<<
+    lumpSum: 0,
+    monthlyContribution: 0,
+    years: 0,
+    targetAmountTodayR: 0,
+    // Other sensible defaults
+    contribEscalationPA: 0, // keep 0 so monthly stays flat unless changed
+    nominalReturnPA: 0.10,
     inflationPA: 0.055,
     timing: "end",
     hasTarget: true,
-    targetAmountTodayR: 1500000,
   };
 }
 
 // ---------- Component ----------
 export default function InvestmentCalculator() {
   const [inp, setInp] = useState<Inputs>(defaultInputs());
+  const [version, setVersion] = useState(0); // force a light remount on reset for visual refresh
 
   const months = Math.max(0, Math.round(inp.years * 12));
 
@@ -113,16 +116,17 @@ export default function InvestmentCalculator() {
         : 0;
 
     const projectedNominal = fvLump + fvContrib;
-    const projectedReal = projectedNominal / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), nonNeg(inp.years));
+    const projectedReal =
+      projectedNominal / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years));
 
-    // Target & shortfall (today’s R)
     const targetReal = inp.hasTarget ? Math.max(0, inp.targetAmountTodayR || 0) : 0;
     const shortfallReal = Math.max(0, targetReal - projectedReal);
 
-    // Extra monthly needed (today’s R) – numeric solve on nominal FV
+    // Extra monthly needed (solve on nominal FV)
     let extraMonthlyToday = 0;
     if (inp.hasTarget && shortfallReal > 0 && n > 0) {
-      const fvNeededNominal = shortfallReal * Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), nonNeg(inp.years));
+      const fvNeededNominal =
+        shortfallReal * Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years));
       const f = (P: number) =>
         fvGrowingAnnuityMonthly(
           nonNeg(P),
@@ -155,7 +159,16 @@ export default function InvestmentCalculator() {
       extraMonthlyToday = Math.max(0, x1);
     }
 
-    // Time-series for line chart (Nominal & Real)
+    const ratioLump = projectedNominal > 0 ? fvLump / projectedNominal : 0;
+    const ratioContrib = projectedNominal > 0 ? fvContrib / projectedNominal : 0;
+
+    const fundedRatio = inp.hasTarget && targetReal > 0 ? projectedReal / targetReal : 0;
+    let health: "good" | "warn" | "bad" = "bad";
+    if (!inp.hasTarget || targetReal <= 0) health = "good";
+    else if (fundedRatio >= 1) health = "good";
+    else if (fundedRatio >= 0.7) health = "warn";
+
+    // Series
     const seriesNominal: number[] = [];
     const seriesReal: number[] = [];
     for (let m = 0; m <= n; m++) {
@@ -177,15 +190,6 @@ export default function InvestmentCalculator() {
       seriesReal.push(real);
     }
 
-    const ratioLump = projectedNominal > 0 ? fvLump / projectedNominal : 0;
-    const ratioContrib = projectedNominal > 0 ? fvContrib / projectedNominal : 0;
-
-    const fundedRatio = inp.hasTarget && targetReal > 0 ? projectedReal / targetReal : 0;
-    let health: "good" | "warn" | "bad" = "bad";
-    if (!inp.hasTarget || targetReal <= 0) health = "good";
-    else if (fundedRatio >= 1) health = "good";
-    else if (fundedRatio >= 0.7) health = "warn";
-
     return {
       fvLump,
       fvContrib,
@@ -204,7 +208,17 @@ export default function InvestmentCalculator() {
   }, [inp, months]);
 
   // Actions
-  const resetInfo = () => setInp(defaultInputs());
+  const resetInfo = () => {
+    // Reset ONLY the specified inputs back to 0; keep other assumptions unchanged
+    setInp((prev) => ({
+      ...prev,
+      lumpSum: 0,
+      monthlyContribution: 0,
+      years: 0,
+      targetAmountTodayR: 0,
+    }));
+    setVersion((v) => v + 1); // visual refresh for number inputs
+  };
 
   const exportCSV = () => {
     const rows: string[] = [];
@@ -244,7 +258,7 @@ export default function InvestmentCalculator() {
 
   const printReport = () => window.print();
 
-  // UI helpers
+  // UI helper
   const field = (label: string, children: React.ReactNode) => (
     <label className="flex flex-col gap-1 text-sm">
       <span className="text-gray-700">{label}</span>
@@ -253,9 +267,9 @@ export default function InvestmentCalculator() {
   );
 
   return (
-    <div className="min-h-screen bg-white text-gray-900">
+    <div className="min-h-screen bg-white text-gray-900" key={version}>
       <div className="mx-auto max-w-7xl px-4 py-8">
-        {/* Header (no logo for sandbox compatibility) */}
+        {/* Header */}
         <header className="mb-6 flex items-center justify-between gap-3">
           <h1 className="text-2xl font-semibold">SmartPlan – Investment Calculator</h1>
           <div className="rounded-full bg-teal-600 px-4 py-1 text-sm font-medium text-white">South Africa</div>
@@ -263,13 +277,28 @@ export default function InvestmentCalculator() {
 
         {/* Quick Actions */}
         <div className="mb-4 flex flex-wrap gap-2">
-          <button onClick={resetInfo} className="rounded-xl border px-3 py-2 text-sm">
+          <button
+            type="button"
+            onClick={resetInfo}
+            className="rounded-xl border px-3 py-2 text-sm"
+            aria-label="Reset selected investment inputs to zero"
+          >
             Reset
           </button>
-          <button onClick={exportCSV} className="rounded-xl border px-3 py-2 text-sm">
+          <button
+            type="button"
+            onClick={exportCSV}
+            className="rounded-xl border px-3 py-2 text-sm"
+            aria-label="Export investment inputs and results to CSV"
+          >
             Export CSV
           </button>
-          <button onClick={printReport} className="rounded-xl border px-3 py-2 text-sm">
+          <button
+            type="button"
+            onClick={printReport}
+            className="rounded-xl border px-3 py-2 text-sm"
+            aria-label="Print or save PDF"
+          >
             Print / Save PDF
           </button>
         </div>
@@ -291,6 +320,7 @@ export default function InvestmentCalculator() {
 
             <div className="mb-3 flex gap-2">
               <button
+                type="button"
                 className={`rounded-xl px-3 py-1 text-sm ${
                   inp.mode === "lump" ? "bg-teal-600 text-white" : "bg-gray-100"
                 }`}
@@ -299,6 +329,7 @@ export default function InvestmentCalculator() {
                 Lump sum only
               </button>
               <button
+                type="button"
                 className={`rounded-xl px-3 py-1 text-sm ${
                   inp.mode === "lump_plus_monthly" ? "bg-teal-600 text-white" : "bg-gray-100"
                 }`}
@@ -328,27 +359,25 @@ export default function InvestmentCalculator() {
                     type="number"
                     className="rounded-xl border p-2"
                     value={inp.monthlyContribution}
-                    onChange={(e) =>
-                      setInp((v) => ({ ...v, monthlyContribution: nonNeg(parseNum(e.target.value)) }))
-                    }
+                    onChange={(e) => setInp((v) => ({ ...v, monthlyContribution: nonNeg(parseNum(e.target.value)) }))}
                   />
                 )}
 
-              {inp.mode === "lump_plus_monthly" && (
+              {inp.mode === "lump_plus_monthly" &&
                 field(
                   "Contribution Escalation (% p.a.)",
                   <Percent
                     value={inp.contribEscalationPA}
                     onChange={(val) => setInp((v) => ({ ...v, contribEscalationPA: clamp(val, -0.99, 2) }))}
                   />
-                )
-              )}
+                )}
 
               {inp.mode === "lump_plus_monthly" && (
                 <label className="flex flex-col gap-1 text-sm">
                   <span className="text-gray-700">Contribution Timing</span>
                   <div className="flex gap-2">
                     <button
+                      type="button"
                       className={`rounded-xl px-3 py-1 text-sm ${
                         inp.timing === "end" ? "bg-teal-600 text-white" : "bg-gray-100"
                       }`}
@@ -357,6 +386,7 @@ export default function InvestmentCalculator() {
                       End of month
                     </button>
                     <button
+                      type="button"
                       className={`rounded-xl px-3 py-1 text-sm ${
                         inp.timing === "begin" ? "bg-teal-600 text-white" : "bg-gray-100"
                       }`}
@@ -448,21 +478,23 @@ export default function InvestmentCalculator() {
               )}
             </div>
 
-            {/* Line Chart: FV over time (Nominal vs Today’s R) */}
+            {/* Line Chart */}
             <div className="mt-6">
               <div className="mb-2 text-sm font-medium">Future Value over time</div>
               <LineChart nominal={results.seriesNominal} real={results.seriesReal} years={inp.years} />
             </div>
 
-            {/* Bar Chart: Final snapshot */}
+            {/* Bar Snapshot */}
             <div className="mt-6">
               <div className="mb-2 text-sm font-medium">Final snapshot (today’s R)</div>
               <BarChartSnapshot
                 required={inp.hasTarget ? results.targetReal : 0}
                 projected={results.projectedReal}
                 shortfall={inp.hasTarget ? Math.max(0, results.targetReal - results.projectedReal) : 0}
-                fromLump={results.fvLump / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), nonNeg(inp.years))}
-                fromMonthly={results.fvContrib / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), nonNeg(inp.years))}
+                fromLump={results.fvLump / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years))}
+                fromMonthly={
+                  results.fvContrib / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years))
+                }
                 showMonthly={inp.mode === "lump_plus_monthly"}
               />
             </div>
@@ -532,14 +564,13 @@ function LineChart({ nominal, real, years }: { nominal: number[]; real: number[]
   const n = Math.max(nominal.length, real.length);
 
   const maxY = Math.max(1, ...nominal, ...real);
-  const denom = Math.max(1, n - 1); // avoid divide-by-zero with 0/1 points
+  const denom = Math.max(1, n - 1);
   const scaleX = (i: number) => pad + (i / denom) * (width - pad * 2);
   const scaleY = (v: number) => height - pad - (v / maxY) * (height - pad * 2);
 
   const pathFrom = (arr: number[]) => {
     if (!arr.length) return "";
     if (arr.length === 1) {
-      // single point — draw a tiny dot instead of a line
       const x = scaleX(0),
         y = scaleY(arr[0]);
       return `M ${x} ${y} m -1,0 a 1,1 0 1,0 2,0 a 1,1 0 1,0 -2,0`;
@@ -554,26 +585,16 @@ function LineChart({ nominal, real, years }: { nominal: number[]; real: number[]
 
   return (
     <svg width="100%" viewBox={`0 0 ${width} ${height}`} className="rounded-xl border bg-white">
-      {/* grid */}
       {gridY.map((gy, idx) => (
         <g key={idx}>
           <line x1={pad} y1={scaleY(gy)} x2={width - pad} y2={scaleY(gy)} stroke="#e5e7eb" strokeWidth="1" />
-          <text
-            x={pad - 4}
-            y={scaleY(gy)}
-            textAnchor="end"
-            dominantBaseline="middle"
-            fontSize="10"
-            fill="#6b7280"
-          >
+          <text x={pad - 4} y={scaleY(gy)} textAnchor="end" dominantBaseline="middle" fontSize="10" fill="#6b7280">
             {abbrCurrency(gy)}
           </text>
         </g>
       ))}
-      {/* paths */}
       <path d={pathFrom(nominal)} fill="none" stroke="#3b82f6" strokeWidth="2" />
       <path d={pathFrom(real)} fill="none" stroke="#16a34a" strokeWidth="2" />
-      {/* legend */}
       <g>
         <rect x={pad} y={8} width="10" height="10" fill="#3b82f6" />
         <text x={pad + 14} y={17} fontSize="11" fill="#374151">
@@ -584,7 +605,6 @@ function LineChart({ nominal, real, years }: { nominal: number[]; real: number[]
           Today’s R
         </text>
       </g>
-      {/* x-axis labels (years) */}
       {[0, Math.max(1, Math.floor(years / 2)), years].map((yr, idx) => {
         const i = years > 0 ? Math.round((yr / years) * Math.max(0, n - 1)) : 0;
         return (
