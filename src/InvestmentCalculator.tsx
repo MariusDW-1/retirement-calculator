@@ -271,7 +271,8 @@ export default function InvestmentCalculator() {
       <div className="mx-auto max-w-7xl px-4 py-8">
         {/* Header */}
         <header className="mb-6 flex items-center justify-between gap-3">
-          <h1 className="text-2xl font-semibold">SmartPlan – Investment Calculator</h1>
+          <img src="/Images/SAFP_logo_250x400.png" alt="SmartPlan Logo" width={120} height={120} />
+          <h1 className="text-2xl font-semibold">New Investment Calculator</h1>
           <div className="rounded-full bg-teal-600 px-4 py-1 text-sm font-medium text-white">South Africa</div>
         </header>
 
