@@ -1,670 +1,501 @@
-import React, { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode, useEffect, useRef } from "react";
+import html2canvas from "html2canvas";
+import jsPDF from "jspdf";
 
-/**
- * SmartPlan – Investment Calculator (South Africa)
- * React + TypeScript + Tailwind (single-file / Canvas-ready)
- *
- * Requirements from user:
- * - The following inputs must default to 0 on page load AND reset to 0 when "Reset" is pressed:
- *   • Lump Sum (R)
- *   • Monthly Contribution (R)
- *   • Years
- *   • Target Amount (Today’s R)
- *   • (Lump-sum only mode) Lump Sum (R) and Years (these are the same fields; mode just hides Monthly)
- *
- * Notes:
- * - Monthly compounding
- * - Real values = nominal / (1+inflation)^years
- * - No external images; CSV + Print actions included
- * - Tailwind classes included
- */
-
-// ---------- Utilities ----------
+/** ================= Utilities ================= */
 function parseNum(v: string | number) {
   if (typeof v === "number") return v;
-  const n = parseFloat((v ?? "").toString().replace(/[^0-9.,-]/g, "").replace(",", "."));
+  const s = (v ?? "").toString().trim();
+  const hasDot = s.includes(".");
+  const hasComma = s.includes(",");
+  let norm = s.replace(/[^0-9.,-]/g, "");
+  if (hasDot && hasComma) {
+    if (norm.lastIndexOf(",") > norm.lastIndexOf(".")) {
+      norm = norm.replace(/\./g, "").replace(/,/g, ".");
+    } else {
+      norm = norm.replace(/,/g, "");
+    }
+  } else if (hasComma && !hasDot) {
+    norm = norm.replace(/\./g, "").replace(/,/g, ".");
+  } else {
+    norm = norm.replace(/,/g, "");
+  }
+  const n = parseFloat(norm);
   return isNaN(n) ? 0 : n;
 }
-const currency = new Intl.NumberFormat("en-ZA", {
-  style: "currency",
-  currency: "ZAR",
-  maximumFractionDigits: 0,
-});
+function safeNum(x: unknown, fallback = 0): number {
+  const n = typeof x === "number" ? x : parseFloat(String(x ?? NaN));
+  return Number.isFinite(n) ? n : fallback;
+}
+// Display helpers: NO decimals, SA locale commas only
+const fmtR0 = (x: number | null | undefined) => {
+  const n = safeNum(x, 0);
+  return `R ${n.toLocaleString("en-ZA", { maximumFractionDigits: 0 })}`;
+};
+function toMoneyStr(n: number) { return safeNum(n, 0).toLocaleString("en-ZA", { maximumFractionDigits: 0 }); }
+function toYearsStr(n: number) { return safeNum(n, 0).toLocaleString("en-ZA", { maximumFractionDigits: 0 }); }
 
-const clamp = (x: number, min: number, max: number) => Math.min(max, Math.max(min, x));
-const nonNeg = (x: number) => Math.max(0, x);
+// Sanitise modern colour functions (e.g. OKLCH) to safe RGB before rasterising
+function sanitizeCssColor(v: string | null): string {
+  if (!v) return "";
+  return v
+    .replace(/oklch\([^)]*\)/gi, "rgb(17,24,39)")
+    .replace(/oklab\([^)]*\)/gi, "rgb(17,24,39)")
+    .replace(/color\([^)]*\)/gi, "rgb(17,24,39)");
+}
 
+/** ================= Financial Maths ================= */
+// Lump sum compounded monthly: FV = PV*(1 + r/12)^(months)
 function fvLumpMonthly(pv: number, annualR: number, months: number) {
   const i = annualR / 12;
   return pv * Math.pow(1 + i, months);
 }
-function fvGrowingAnnuityMonthly(
-  P0Monthly: number,
-  annualR: number,
-  annualG: number,
-  months: number,
-  timing: "end" | "begin"
-) {
-  if (months <= 0 || P0Monthly <= 0) return 0;
-  const i = annualR / 12;
-  const j = annualG / 12;
-  if (Math.abs(i - j) < 1e-10) {
-    const fvSame = P0Monthly * months * Math.pow(1 + i, months);
-    return timing === "begin" ? fvSame * (1 + i) : fvSame;
-  }
-  const fv = P0Monthly * ((Math.pow(1 + i, months) - Math.pow(1 + j, months)) / (i - j));
+// Ordinary annuity (with option to switch to annuity-due by multiplying (1+i))
+function fvOrdinaryAnnuityMonthly(P: number, annualR: number, years: number, timing: "end" | "begin") {
+  if (P <= 0 || years <= 0) return 0;
+  const r = annualR; const m = 12; const i = r / m; const n = years * m;
+  const fv = P * ((Math.pow(1 + i, n) - 1) / i);
   return timing === "begin" ? fv * (1 + i) : fv;
 }
+// Escalating annual contributions: sum_t C_t*(1+r)^(n-t)
+function fvEscalatingAnnualContrib(P0Monthly: number, annualR: number, annualG: number, years: number) {
+  if (P0Monthly <= 0 || years <= 0) return 0;
+  let total = 0;
+  for (let t = 1; t <= years; t++) {
+    const annualContrib = P0Monthly * 12 * Math.pow(1 + annualG, t - 1);
+    const growYears = years - t + 1; // end-of-year to maturity
+    total += annualContrib * Math.pow(1 + annualR, growYears);
+  }
+  return total;
+}
 
+/** ================= Types & Defaults ================= */
+type Mode = "lump" | "monthly" | "lump_plus_monthly";
 type Timing = "end" | "begin";
-type Mode = "lump" | "lump_plus_monthly";
+type InvestmentType = "Type" | "TFSA" | "Unit Trust" | "ETF" | "Fixed Deposit" | "Endowment" | "Other";
 
-// ---------- Types ----------
+interface ClientInfo { name: string; surname: string; email: string; mobile: string; idNumber: string; }
 interface Inputs {
-  mode: Mode;
-  // must default to 0 and reset to 0:
-  lumpSum: number;
-  monthlyContribution: number;
-  years: number;
-  targetAmountTodayR: number;
-  // other assumptions:
-  contribEscalationPA: number;
-  nominalReturnPA: number;
-  inflationPA: number;
-  timing: Timing;
+  client: ClientInfo; ageManual: number | null;
+  investmentType: InvestmentType;
+  mode: Mode; lumpSum: number; monthlyContribution: number; years: number; targetAmountTodayR: number;
+  nominalReturnPA: number; inflationPA: number; contribEscalationPA: number; timing: Timing;
   hasTarget: boolean;
 }
 
+const INVESTMENT_HELP: Record<InvestmentType, string> = {
+  Type: "Select the type of investment.",
+  TFSA: "Tax-free investment; SARS annual/lifetime contribution limits apply.",
+  "Unit Trust": "Collective investment scheme (pooled funds). Capital gains/dividends taxable.",
+  ETF: "Exchange-traded fund tracking an index or theme. Market risk applies.",
+  "Fixed Deposit": "Bank deposit with fixed term/rate; limited liquidity; interest taxable.",
+  Endowment: "Policy wrapper with 5-year restriction; tax handled within the fund.",
+  Other: "Custom product. Confirm fees, liquidity, and tax treatment.",
+};
+
 function defaultInputs(): Inputs {
   return {
+    client: { name: "", surname: "", email: "", mobile: "", idNumber: "" },
+    ageManual: 0,
+    investmentType: "Type", // mandatory default
     mode: "lump_plus_monthly",
-    // >>> Defaults requested as 0 <<<
     lumpSum: 0,
     monthlyContribution: 0,
-    years: 0,
+    years: 1, // mandatory >= 1
     targetAmountTodayR: 0,
-    // Other sensible defaults
-    contribEscalationPA: 0, // keep 0 so monthly stays flat unless changed
-    nominalReturnPA: 0.10,
-    inflationPA: 0.055,
+    nominalReturnPA: 0.08,      // 8%
+    inflationPA: 0.055,         // 5.5%
+    contribEscalationPA: 0.10,  // 10%
     timing: "end",
-    hasTarget: true,
+    hasTarget: false,
   };
 }
 
-// ---------- Component ----------
+/** ================= Component ================= */
 export default function InvestmentCalculator() {
   const [inp, setInp] = useState<Inputs>(defaultInputs());
-  const [version, setVersion] = useState(0); // force a light remount on reset for visual refresh
+  const [lumpStr, setLumpStr] = useState<string>(toMoneyStr(0));
+  const [monthlyStr, setMonthlyStr] = useState<string>(toMoneyStr(0));
+  const [yearsStr, setYearsStr] = useState<string>(toYearsStr(1));
+  const [typeTouched, setTypeTouched] = useState(false);
+  const [yearsTouched, setYearsTouched] = useState(false);
+  const printRef = useRef<HTMLDivElement | null>(null);
 
-  const months = Math.max(0, Math.round(inp.years * 12));
+  // Validations
+  const isTypeValid = inp.investmentType !== "Type";
+  const isYearsValid = (inp.years ?? 0) >= 1;
 
+  // PDF export (html2canvas + jsPDF) with OKLCH sanitisation
+  const handlePrint = async () => {
+    if (!printRef.current) return;
+    const sandbox = document.createElement('div');
+    sandbox.style.position = 'fixed';
+    sandbox.style.left = '-10000px';
+    sandbox.style.top = '0';
+    sandbox.style.width = (printRef.current.clientWidth || 1024) + 'px';
+    sandbox.style.background = '#ffffff';
+
+    const style = document.createElement('style');
+    style.textContent = `:root,*{--tw-ring-color: rgba(59,130,246,0.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;}`;
+    sandbox.appendChild(style);
+
+    const src = printRef.current;
+    const clone = src.cloneNode(true) as HTMLElement;
+    sandbox.appendChild(clone);
+    document.body.appendChild(sandbox);
+
+    // Inline key computed styles with RGB fallbacks
+    const origEls = src.querySelectorAll('*');
+    const cloneEls = clone.querySelectorAll('*');
+    const len = Math.min(origEls.length, cloneEls.length);
+    for (let i = 0; i < len; i++) {
+      const o = origEls[i] as HTMLElement;
+      const c = cloneEls[i] as HTMLElement;
+      const cs = getComputedStyle(o);
+      c.style.display = cs.display;
+      c.style.position = cs.position;
+      c.style.margin = cs.margin;
+      c.style.padding = cs.padding;
+      (c.style as any).gap = (cs as any).gap || '';
+      c.style.borderWidth = cs.borderWidth;
+      c.style.borderStyle = cs.borderStyle;
+      c.style.borderColor = sanitizeCssColor(cs.borderColor);
+      c.style.borderRadius = cs.borderRadius;
+      c.style.backgroundColor = sanitizeCssColor(cs.backgroundColor);
+      c.style.color = sanitizeCssColor(cs.color);
+      c.style.font = cs.font;
+      c.style.textAlign = cs.textAlign;
+      c.style.boxShadow = 'none';
+      c.style.textShadow = 'none';
+      c.style.outlineColor = sanitizeCssColor(cs.outlineColor);
+    }
+
+    try {
+      const canvas = await html2canvas(clone, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        useCORS: true,
+        onclone: (doc) => {
+          doc.querySelectorAll('style').forEach(st => {
+            if (st.textContent && /oklch\(/i.test(st.textContent)) {
+              st.textContent = st.textContent.replace(/oklch\([^)]*\)/gi, 'rgb(17,24,39)');
+            }
+          });
+        },
+      });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgProps = pdf.getImageProperties(imgData);
+      const ratio = Math.min(pageWidth / imgProps.width, (pageHeight - 24) / imgProps.height);
+      const imgW = imgProps.width * ratio;
+      const imgH = imgProps.height * ratio;
+      const x = (pageWidth - imgW) / 2;
+      const y = 12;
+      pdf.addImage(imgData, 'PNG', x, y, imgW, imgH);
+      pdf.save('SmartPlan-Investment-Report.pdf');
+    } finally {
+      try { document.body.removeChild(sandbox); } catch {}
+    }
+  };
+
+  // Clear Info -> resets to defaults and clears touched state
+  const handleClearInfo = () => {
+    setInp(defaultInputs());
+    setLumpStr(toMoneyStr(0));
+    setMonthlyStr(toMoneyStr(0));
+    setYearsStr(toYearsStr(1));
+    setTypeTouched(false);
+    setYearsTouched(false);
+  };
+
+  // Seed string inputs once on mount and run tests
+  useEffect(() => {
+    setLumpStr(toMoneyStr(inp.lumpSum));
+    setMonthlyStr(toMoneyStr(inp.monthlyContribution));
+    setYearsStr(toYearsStr(inp.years));
+    // Tests / sanity checks
+    try {
+      console.assert(Math.abs(fvLumpMonthly(1000, 0.12, 12) - 1000*Math.pow(1+0.12/12,12)) < 1e-6, "fvLumpMonthly");
+      const i = 0.1/12; const endFV = fvOrdinaryAnnuityMonthly(1000, 0.1, 1, 'end'); const beginFV = fvOrdinaryAnnuityMonthly(1000, 0.1, 1, 'begin');
+      console.assert(Math.abs(beginFV - endFV*(1+i)) < 1e-6, "annuity due relation");
+      console.assert(parseNum('1,500,000') === 1500000, 'parse thousands');
+      console.assert(parseNum('900,000,000') === 900000000, 'parse hundreds of millions');
+      // Additional: check escalating reduces to ordinary when g=0
+      const a = fvEscalatingAnnualContrib(1000, 0.1, 0, 1);
+      console.assert(Math.abs(a - (1000*12)*Math.pow(1+0.1,1)) < 1e-6, 'escalating g=0 base year');
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const months = Math.max(0, Math.round((inp.years || 0) * 12));
+
+  /** -------- Results -------- */
   const results = useMemo(() => {
-    const n = months;
-
-    // Nominal FV components
-    const fvLump = fvLumpMonthly(nonNeg(inp.lumpSum || 0), clamp(inp.nominalReturnPA, -0.99, 2), n);
-    const fvContrib =
-      inp.mode === "lump_plus_monthly"
-        ? fvGrowingAnnuityMonthly(
-            nonNeg(inp.monthlyContribution || 0),
-            clamp(inp.nominalReturnPA, -0.99, 2),
-            clamp(inp.contribEscalationPA || 0, -0.99, 2),
-            n,
-            inp.timing
-          )
-        : 0;
-
+    const r = inp.nominalReturnPA; const g = inp.contribEscalationPA;
+    const fvLump = inp.mode !== 'monthly' ? fvLumpMonthly(Math.max(0, inp.lumpSum || 0), r, months) : 0;
+    let fvContrib = 0;
+    if (inp.mode !== 'lump') {
+      if (g > 0) fvContrib = fvEscalatingAnnualContrib(Math.max(0, inp.monthlyContribution || 0), r, g, inp.years);
+      else fvContrib = fvOrdinaryAnnuityMonthly(Math.max(0, inp.monthlyContribution || 0), r, inp.years, inp.timing);
+    }
     const projectedNominal = fvLump + fvContrib;
-    const projectedReal =
-      projectedNominal / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years));
 
-    const targetReal = inp.hasTarget ? Math.max(0, inp.targetAmountTodayR || 0) : 0;
-    const shortfallReal = Math.max(0, targetReal - projectedReal);
-
-    // Extra monthly needed (solve on nominal FV)
-    let extraMonthlyToday = 0;
-    if (inp.hasTarget && shortfallReal > 0 && n > 0) {
-      const fvNeededNominal =
-        shortfallReal * Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years));
-      const f = (P: number) =>
-        fvGrowingAnnuityMonthly(
-          nonNeg(P),
-          clamp(inp.nominalReturnPA, -0.99, 2),
-          clamp(inp.contribEscalationPA || 0, -0.99, 2),
-          n,
-          inp.timing
-        ) - fvNeededNominal;
-
-      let x0 = 0,
-        x1 = 100000;
-      for (let k = 0; k < 40; k++) {
-        const y0 = f(x0),
-          y1 = f(x1);
-        if (!isFinite(y0) || !isFinite(y1)) {
-          x0 = 0;
-          x1 = Math.max(1000, x1 / 2);
-          continue;
-        }
-        if (Math.abs(y1 - y0) < 1e-6) break;
-        const x2 = x1 - (y1 * (x1 - x0)) / (y1 - y0);
-        if (!isFinite(x2)) {
-          x0 = 0;
-          x1 *= 0.5;
-          continue;
-        }
-        x0 = x1;
-        x1 = Math.max(0, x2);
-      }
-      extraMonthlyToday = Math.max(0, x1);
+    // Series (yearly)
+    const seriesLump: number[] = [];
+    const seriesContrib: number[] = [];
+    const yrs = Math.max(1, Math.floor(inp.years));
+    for (let y = 0; y <= yrs; y++) {
+      seriesLump.push(fvLumpMonthly(Math.max(0, inp.lumpSum || 0), r, y * 12));
+      seriesContrib.push(g > 0
+        ? fvEscalatingAnnualContrib(Math.max(0, inp.monthlyContribution || 0), r, g, y)
+        : fvOrdinaryAnnuityMonthly(Math.max(0, inp.monthlyContribution || 0), r, y, inp.timing)
+      );
     }
-
-    const ratioLump = projectedNominal > 0 ? fvLump / projectedNominal : 0;
-    const ratioContrib = projectedNominal > 0 ? fvContrib / projectedNominal : 0;
-
-    const fundedRatio = inp.hasTarget && targetReal > 0 ? projectedReal / targetReal : 0;
-    let health: "good" | "warn" | "bad" = "bad";
-    if (!inp.hasTarget || targetReal <= 0) health = "good";
-    else if (fundedRatio >= 1) health = "good";
-    else if (fundedRatio >= 0.7) health = "warn";
-
-    // Series
-    const seriesNominal: number[] = [];
-    const seriesReal: number[] = [];
-    for (let m = 0; m <= n; m++) {
-      const nomL = fvLumpMonthly(nonNeg(inp.lumpSum || 0), clamp(inp.nominalReturnPA, -0.99, 2), m);
-      const nomC =
-        inp.mode === "lump_plus_monthly"
-          ? fvGrowingAnnuityMonthly(
-              nonNeg(inp.monthlyContribution || 0),
-              clamp(inp.nominalReturnPA, -0.99, 2),
-              clamp(inp.contribEscalationPA || 0, -0.99, 2),
-              m,
-              inp.timing
-            )
-          : 0;
-      const nom = nomL + nomC;
-      const yearsFrac = m / 12;
-      const real = nom / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), yearsFrac);
-      seriesNominal.push(nom);
-      seriesReal.push(real);
-    }
-
-    return {
-      fvLump,
-      fvContrib,
-      projectedNominal,
-      projectedReal,
-      targetReal,
-      shortfallReal,
-      extraMonthlyToday,
-      ratioLump,
-      ratioContrib,
-      fundedRatio,
-      health,
-      seriesNominal,
-      seriesReal,
-    };
+    return { projectedNominal, fvLump, fvContrib, seriesLump, seriesContrib };
   }, [inp, months]);
 
-  // Actions
-  const resetInfo = () => {
-    // Reset ONLY the specified inputs back to 0; keep other assumptions unchanged
-    setInp((prev) => ({
-      ...prev,
-      lumpSum: 0,
-      monthlyContribution: 0,
-      years: 0,
-      targetAmountTodayR: 0,
-    }));
-    setVersion((v) => v + 1); // visual refresh for number inputs
-  };
+  /** -------- Chart geometry (labels inside frame) -------- */
+  const chart = useMemo(() => {
+    const w = 920, h = 400, pad = 56, rightPad = 240;
+    const lump = results.seriesLump; const contrib = results.seriesContrib;
+    const total = lump.map((v, i) => v + (contrib[i] || 0));
+    const n = Math.max(2, lump.length);
+    const maxY = Math.max(1, ...total);
+    const step = Math.max(500000, Math.pow(10, Math.floor(Math.log10(maxY)) - 1));
+    const niceMax = Math.ceil(maxY / step) * step;
+    const sx = (i: number) => pad + (i / (n - 1)) * (w - pad - rightPad);
+    const sy = (v: number) => h - pad - (v / niceMax) * (h - pad * 2);
+    const clampY = (y: number) => Math.min(h - pad - 8, Math.max(pad + 8, y));
+    const buildPath = (arr: number[]) => arr.map((vv, ii) => `${ii === 0 ? 'M' : 'L'} ${sx(ii)} ${sy(vv)}`).join(' ');
 
-  const exportCSV = () => {
-    const rows: string[] = [];
-    const dt = new Date().toISOString();
-    rows.push(`Generated,${dt}`);
-    rows.push(`Mode,${inp.mode === "lump" ? "Lump only" : "Lump + Monthly"}`);
-    rows.push(`Lump sum (R),${inp.lumpSum}`);
-    rows.push(`Monthly contribution (R),${inp.monthlyContribution}`);
-    rows.push(`Contribution escalation (% p.a.),${Math.round((inp.contribEscalationPA || 0) * 10000) / 100}`);
-    rows.push(`Years,${inp.years}`);
-    rows.push(`Expected return (% p.a.),${Math.round((inp.nominalReturnPA || 0) * 10000) / 100}`);
-    rows.push(`Inflation (CPI, % p.a.),${Math.round((inp.inflationPA || 0) * 10000) / 100}`);
-    rows.push(`Timing,${inp.timing === "begin" ? "Start of month" : "End of month"}`);
-    rows.push(`Target enabled,${inp.hasTarget}`);
-    rows.push(`Target (today's R),${inp.targetAmountTodayR}`);
-    rows.push("--- results ---");
-    rows.push(`Projected (Nominal, R),${Math.round(results.projectedNominal)}`);
-    rows.push(`Projected (Today’s R),${Math.round(results.projectedReal)}`);
-    if (inp.mode === "lump_plus_monthly") {
-      rows.push(`From Lump Sum (%),${((results.fvLump / results.projectedNominal) * 100 || 0).toFixed(1)}`);
-      rows.push(`From Contributions (%),${((results.fvContrib / results.projectedNominal) * 100 || 0).toFixed(1)}`);
+    const yTickCount = Math.max(3, Math.min(8, Math.round(niceMax / step)));
+    const ticks: { y: number; label: string }[] = [];
+    for (let k = 0; k <= yTickCount; k++) {
+      const val = (niceMax / yTickCount) * k;
+      ticks.push({ y: sy(val), label: fmtR0(val) });
     }
-    if (inp.hasTarget) {
-      rows.push(`Target (Today’s R),${Math.round(results.targetReal)}`);
-      rows.push(`Shortfall (Today’s R),${Math.round(results.shortfallReal)}`);
-      rows.push(`Extra monthly needed (Today’s R),${Math.round(results.extraMonthlyToday)}`);
-      rows.push(`Funding ratio,${results.fundedRatio.toFixed(3)}`);
-    }
-    const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `smartplan_investment_${Date.now()}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
 
-  const printReport = () => window.print();
+    const i = n - 1; const xEnd = sx(i);
+    const yT0 = clampY(sy(total[i] || 0));
+    let yL0 = clampY(sy(lump[i] || 0));
+    let yC0 = clampY(sy(contrib[i] || 0));
+    const sep = 16;
+    if (Math.abs(yL0 - yT0) < sep) yL0 = yT0 + sep;
+    if (Math.abs(yC0 - yT0) < sep) yC0 = yT0 - sep;
+    if (Math.abs(yL0 - yC0) < sep) yC0 = yL0 - sep;
 
-  // UI helper
-  const field = (label: string, children: React.ReactNode) => (
+    return {
+      w, h, pad, rightPad, sx, sy, ticks,
+      pathLump: buildPath(lump),
+      pathContrib: buildPath(contrib),
+      pathTotal: buildPath(total),
+      xEnd,
+      yTotal: yT0,
+      yLump: yL0,
+      yContrib: yC0,
+      endValues: { total: total[i] || 0, lump: lump[i] || 0, contrib: contrib[i] || 0 },
+    };
+  }, [results]);
+
+  /** -------- Helpers -------- */
+  const field = (label: string, children: ReactNode) => (
     <label className="flex flex-col gap-1 text-sm">
       <span className="text-gray-700">{label}</span>
       {children}
     </label>
   );
 
+  // Handlers for free-typing fields (commas allowed)
+  const onLumpChange = (s: string) => { setLumpStr(s); setInp(v => ({ ...v, lumpSum: Math.max(0, parseNum(s)) })); };
+  const onLumpBlur = () => setLumpStr(toMoneyStr(inp.lumpSum));
+  const onMonthlyChange = (s: string) => { setMonthlyStr(s); setInp(v => ({ ...v, monthlyContribution: Math.max(0, parseNum(s)) })); };
+  const onMonthlyBlur = () => setMonthlyStr(toMoneyStr(inp.monthlyContribution));
+  const onYearsChange = (s: string) => { setYearsStr(s); setInp(v => ({ ...v, years: Math.max(0, parseNum(s)) })); };
+  const onYearsBlur = () => { setYearsTouched(true); setYearsStr(toYearsStr(inp.years)); };
+
   return (
-    <div className="min-h-screen bg-white text-gray-900" key={version}>
-      <div className="mx-auto max-w-7xl px-4 py-8">
-        {/* Header */}
-        <header className="mb-6 flex items-center justify-between gap-3">
-          <img src="/Images/SAFP_logo_250x400.png" alt="SmartPlan Logo" width={120} height={120} />
-          <h1 className="text-2xl font-semibold">New Investment Calculator</h1>
+    <div className="min-h-screen bg-white text-gray-900">
+      <div className="mx-auto max-w-7xl px-4 py-8" id="print-root" ref={printRef}>
+        <header className="mb-6 flex items-center justify-between">
+          <h1 className="text-2xl font-semibold">SmartPlan – Investment Calculator</h1>
           <div className="rounded-full bg-teal-600 px-4 py-1 text-sm font-medium text-white">South Africa</div>
         </header>
 
-        {/* Quick Actions */}
-        <div className="mb-4 flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={resetInfo}
-            className="rounded-xl border px-3 py-2 text-sm"
-            aria-label="Reset selected investment inputs to zero"
-          >
-            Reset
-          </button>
-          <button
-            type="button"
-            onClick={exportCSV}
-            className="rounded-xl border px-3 py-2 text-sm"
-            aria-label="Export investment inputs and results to CSV"
-          >
-            Export CSV
-          </button>
-          <button
-            type="button"
-            onClick={printReport}
-            className="rounded-xl border px-3 py-2 text-sm"
-            aria-label="Print or save PDF"
-          >
-            Print / Save PDF
-          </button>
+        {/* Actions */}
+        <div className="mb-4 flex flex-wrap gap-2 no-print">
+          <button onClick={handleClearInfo} className="rounded-xl border px-3 py-2 text-sm">Clear Info</button>
+          <button onClick={handlePrint} className="rounded-xl border px-3 py-2 text-sm" disabled={!isTypeValid || !isYearsValid} title={!isTypeValid ? 'Select Investment Type' : !isYearsValid ? 'Years must be at least 1' : 'Download PDF'}>Download PDF</button>
+          <button onClick={() => window.print()} className="rounded-xl border px-3 py-2 text-sm">Browser Print</button>
         </div>
 
-        {/* Status */}
-        <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-4">
-          <Stat label="Years">{inp.years}</Stat>
-          <Stat label="Projected (Nominal)">{currency.format(Math.round(results.projectedNominal))}</Stat>
-          <Stat label="Projected (Today’s R)">{currency.format(Math.round(results.projectedReal))}</Stat>
-          <Stat label="Funding">
-            {inp.hasTarget && results.fundedRatio ? `${(results.fundedRatio * 100).toFixed(1)}%` : "—"}
-          </Stat>
-        </div>
+        {/* Client Details */}
+        <section className="rounded-2xl border p-6 shadow-sm mb-6">
+          <h2 className="mb-4 text-lg font-semibold">Client Details</h2>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {field("Name", <input className="rounded-xl border p-2" value={inp.client.name} onChange={e=>setInp(v=>({...v, client:{...v.client, name:e.target.value}}))} />)}
+            {field("Surname", <input className="rounded-xl border p-2" value={inp.client.surname} onChange={e=>setInp(v=>({...v, client:{...v.client, surname:e.target.value}}))} />)}
+            {field("Email", <input className="rounded-xl border p-2" value={inp.client.email} onChange={e=>setInp(v=>({...v, client:{...v.client, email:e.target.value}}))} />)}
+            {field("Mobile", <input className="rounded-xl border p-2" value={inp.client.mobile} onChange={e=>setInp(v=>({...v, client:{...v.client, mobile:e.target.value}}))} />)}
+            {field("South African ID (13 digits)", <input className="rounded-xl border p-2" value={inp.client.idNumber} onChange={e=>setInp(v=>({...v, client:{...v.client, idNumber:e.target.value.replace(/\D/g, '').slice(0,13)}}))} />)}
+          </div>
+        </section>
 
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          {/* Assumptions */}
-          <section className="rounded-2xl border p-6 shadow-sm">
-            <h2 className="mb-4 text-lg font-semibold">Assumptions</h2>
+        {/* Assumptions */}
+        <section className="rounded-2xl border p-6 shadow-sm mb-6">
+          <h2 className="mb-4 text-lg font-semibold">Assumptions</h2>
 
-            <div className="mb-3 flex gap-2">
-              <button
-                type="button"
-                className={`rounded-xl px-3 py-1 text-sm ${
-                  inp.mode === "lump" ? "bg-teal-600 text-white" : "bg-gray-100"
-                }`}
-                onClick={() => setInp((v) => ({ ...v, mode: "lump" }))}
-              >
-                Lump sum only
-              </button>
-              <button
-                type="button"
-                className={`rounded-xl px-3 py-1 text-sm ${
-                  inp.mode === "lump_plus_monthly" ? "bg-teal-600 text-white" : "bg-gray-100"
-                }`}
-                onClick={() => setInp((v) => ({ ...v, mode: "lump_plus_monthly" }))}
-              >
-                Lump sum + monthly
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              {field(
-                "Lump Sum (R)",
-                <input
-                  aria-label="Lump Sum (R)"
-                  type="number"
-                  className="rounded-xl border p-2"
-                  value={inp.lumpSum}
-                  onChange={(e) => setInp((v) => ({ ...v, lumpSum: nonNeg(parseNum(e.target.value)) }))}
-                />
-              )}
-
-              {inp.mode === "lump_plus_monthly" &&
-                field(
-                  "Monthly Contribution (R)",
-                  <input
-                    aria-label="Monthly Contribution (R)"
-                    type="number"
-                    className="rounded-xl border p-2"
-                    value={inp.monthlyContribution}
-                    onChange={(e) => setInp((v) => ({ ...v, monthlyContribution: nonNeg(parseNum(e.target.value)) }))}
-                  />
-                )}
-
-              {inp.mode === "lump_plus_monthly" &&
-                field(
-                  "Contribution Escalation (% p.a.)",
-                  <Percent
-                    value={inp.contribEscalationPA}
-                    onChange={(val) => setInp((v) => ({ ...v, contribEscalationPA: clamp(val, -0.99, 2) }))}
-                  />
-                )}
-
-              {inp.mode === "lump_plus_monthly" && (
-                <label className="flex flex-col gap-1 text-sm">
-                  <span className="text-gray-700">Contribution Timing</span>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      className={`rounded-xl px-3 py-1 text-sm ${
-                        inp.timing === "end" ? "bg-teal-600 text-white" : "bg-gray-100"
-                      }`}
-                      onClick={() => setInp((v) => ({ ...v, timing: "end" }))}
-                    >
-                      End of month
-                    </button>
-                    <button
-                      type="button"
-                      className={`rounded-xl px-3 py-1 text-sm ${
-                        inp.timing === "begin" ? "bg-teal-600 text-white" : "bg-gray-100"
-                      }`}
-                      onClick={() => setInp((v) => ({ ...v, timing: "begin" }))}
-                    >
-                      Start of month
-                    </button>
-                  </div>
-                </label>
-              )}
-
-              {field(
-                "Years",
-                <input
-                  aria-label="Years"
-                  type="number"
-                  className="rounded-xl border p-2"
-                  value={inp.years}
-                  onChange={(e) => setInp((v) => ({ ...v, years: nonNeg(parseNum(e.target.value)) }))}
-                />
-              )}
-
-              {field(
-                "Expected Return (% p.a.)",
-                <Percent
-                  value={inp.nominalReturnPA}
-                  onChange={(val) => setInp((v) => ({ ...v, nominalReturnPA: clamp(val, -0.99, 2) }))}
-                />
-              )}
-
-              {field(
-                "Inflation (CPI, % p.a.)",
-                <Percent
-                  value={inp.inflationPA}
-                  onChange={(val) => setInp((v) => ({ ...v, inflationPA: clamp(val, -0.99, 2) }))}
-                />
-              )}
-            </div>
-          </section>
-
-          {/* Goal (optional) */}
-          <section className="rounded-2xl border p-6 shadow-sm">
-            <h2 className="mb-4 text-lg font-semibold">Goal (Optional)</h2>
-            <div className="mb-3">
-              <label className="inline-flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4"
-                  checked={inp.hasTarget}
-                  onChange={(e) => setInp((v) => ({ ...v, hasTarget: e.target.checked }))}
-                />
-                <span>Compare to a Target (today’s Rand)</span>
-              </label>
-            </div>
-            {inp.hasTarget && (
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                {field(
-                  "Target Amount (Today’s R)",
-                  <input
-                    aria-label="Target Amount (Today’s R)"
-                    type="number"
-                    className="rounded-xl border p-2"
-                    value={inp.targetAmountTodayR}
-                    onChange={(e) =>
-                      setInp((v) => ({ ...v, targetAmountTodayR: nonNeg(parseNum(e.target.value)) }))
-                    }
-                  />
-                )}
-                <div className="rounded-xl bg-gray-50 p-3 text-sm">
-                  Extra monthly (today’s R) needed: <b>{currency.format(Math.round(results.extraMonthlyToday))}</b>
-                </div>
-              </div>
-            )}
-          </section>
-
-          {/* Results & Visuals */}
-          <section className="rounded-2xl border p-6 shadow-sm lg:col-span-2">
-            <h2 className="mb-4 text-lg font-semibold">Results</h2>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-              <Stat label="Projected (Nominal)">{currency.format(Math.round(results.projectedNominal))}</Stat>
-              <Stat label="Projected (Today’s R)">{currency.format(Math.round(results.projectedReal))}</Stat>
-              {inp.mode === "lump_plus_monthly" ? (
-                <Stat label="From Lump / From Monthly">
-                  {(results.ratioLump * 100).toFixed(1)}% / {(results.ratioContrib * 100).toFixed(1)}%
-                </Stat>
-              ) : (
-                <Stat label="From Lump / From Monthly">100.0% / 0.0%</Stat>
-              )}
-            </div>
-
-            {/* Line Chart */}
-            <div className="mt-6">
-              <div className="mb-2 text-sm font-medium">Future Value over time</div>
-              <LineChart nominal={results.seriesNominal} real={results.seriesReal} years={inp.years} />
-            </div>
-
-            {/* Bar Snapshot */}
-            <div className="mt-6">
-              <div className="mb-2 text-sm font-medium">Final snapshot (today’s R)</div>
-              <BarChartSnapshot
-                required={inp.hasTarget ? results.targetReal : 0}
-                projected={results.projectedReal}
-                shortfall={inp.hasTarget ? Math.max(0, results.targetReal - results.projectedReal) : 0}
-                fromLump={results.fvLump / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years))}
-                fromMonthly={
-                  results.fvContrib / Math.pow(1 + clamp(inp.inflationPA, -0.99, 2), Math.max(0, inp.years))
-                }
-                showMonthly={inp.mode === "lump_plus_monthly"}
-              />
-            </div>
-
-            {/* Funding Level */}
-            {inp.hasTarget && results.targetReal > 0 && (
-              <div className="mt-4">
-                <div className="mb-1 text-sm">Funding Level</div>
-                <div className="h-4 w-full rounded-full bg-gray-200">
-                  <div
-                    className={`h-4 rounded-full ${
-                      results.health === "good" ? "bg-green-500" : results.health === "warn" ? "bg-yellow-500" : "bg-red-500"
-                    }`}
-                    style={{ width: `${Math.min(100, results.fundedRatio * 100).toFixed(1)}%` }}
-                  />
-                </div>
-                <div className="mt-1 text-xs text-gray-600">{(results.fundedRatio * 100).toFixed(1)}% funded</div>
-              </div>
+          {/* Investment Type (same size as others; red only after touch if invalid) */}
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 mb-3">
+            {field("Investment Type",
+              <>
+                <select
+                  required
+                  className={`rounded-xl border p-2 ${!isTypeValid && typeTouched ? 'border-red-500' : ''}`}
+                  title={INVESTMENT_HELP[inp.investmentType]}
+                  value={inp.investmentType}
+                  onChange={e=>{ setTypeTouched(true); setInp(v=>({...v, investmentType: e.target.value as InvestmentType})); }}
+                >
+                  <option value="Type">Type</option>
+                  <option value="TFSA">TFSA</option>
+                  <option value="Unit Trust">Unit Trust</option>
+                  <option value="ETF">ETF</option>
+                  <option value="Fixed Deposit">Fixed Deposit</option>
+                  <option value="Endowment">Endowment</option>
+                  <option value="Other">Other</option>
+                </select>
+                {!isTypeValid && typeTouched && <div className="mt-1 text-xs text-red-600">Please select an investment type.</div>}
+                <div className="mt-1 text-xs text-gray-600">{INVESTMENT_HELP[inp.investmentType]}</div>
+              </>
             )}
 
-            <div className="mt-6 rounded-xl bg-gray-50 p-4 text-xs text-gray-600">
-              Disclaimer: Estimates only; not financial advice. Returns and inflation are assumptions and may differ from
-              actual outcomes. Verify FSCA/FAIS disclosures and POPIA consent if client data is processed.
-            </div>
-          </section>
-        </div>
+            {/* Years (mandatory, red only after touch) */}
+            {field("Years",
+              <div>
+                <input
+                  type="text"
+                  className={`rounded-xl border p-2 w-full ${((inp.years ?? 0) < 1 && yearsTouched) ? 'border-red-500' : ''}`}
+                  value={yearsStr}
+                  onChange={e=>{ setYearsStr(e.target.value); setInp(v=>({ ...v, years: Math.max(0, parseNum(e.target.value)) })); }}
+                  onBlur={()=>{ setYearsTouched(true); setYearsStr(toYearsStr(inp.years)); }}
+                  placeholder="e.g. 15"
+                />
+                {((inp.years ?? 0) < 1 && yearsTouched) && <div className="mt-1 text-xs text-red-600">Years must be at least 1.</div>}
+              </div>
+            )}
+          </div>
 
-        <footer className="mt-8 text-xs text-gray-500">
-          © {new Date().getFullYear()} SA Financial Planners – Investment estimator.
-        </footer>
+          {/* Mode selector */}
+          <div className="mb-3 flex flex-wrap gap-2">
+            <button className={`rounded-xl px-3 py-1 text-sm ${inp.mode === 'lump' ? 'bg-teal-600 text-white' : 'bg-gray-100'}`} onClick={() => setInp(v => ({ ...v, mode: 'lump' }))}>Lump sum only</button>
+            <button className={`rounded-xl px-3 py-1 text-sm ${inp.mode === 'monthly' ? 'bg-teal-600 text-white' : 'bg-gray-100'}`} onClick={() => setInp(v => ({ ...v, mode: 'monthly' }))}>Monthly only</button>
+            <button className={`rounded-xl px-3 py-1 text-sm ${inp.mode === 'lump_plus_monthly' ? 'bg-teal-600 text-white' : 'bg-gray-100'}`} onClick={() => setInp(v => ({ ...v, mode: 'lump_plus_monthly' }))}>Lump sum + monthly</button>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {inp.mode !== "monthly" && field("Lump Sum (R)",
+              <input type="text" className="rounded-xl border p-2" value={lumpStr} onChange={e=>onLumpChange(e.target.value)} onBlur={onLumpBlur} placeholder="e.g. 500,000" />
+            )}
+            {inp.mode !== "lump" && field("Monthly Contribution (R)",
+              <input type="text" className="rounded-xl border p-2" value={monthlyStr} onChange={e=>onMonthlyChange(e.target.value)} onBlur={onMonthlyBlur} placeholder="e.g. 10,000" />
+            )}
+
+            {/* Contribution Timing */}
+            <label className="flex flex-col gap-1 text-sm">
+              <span className="text-gray-700">Contribution Timing</span>
+              <div className="flex gap-2">
+                <button className={`rounded-xl px-3 py-1 text-sm ${inp.timing === 'end' ? 'bg-teal-600 text-white' : 'bg-gray-100'}`} onClick={()=>setInp(v=>({...v, timing: 'end'}))}>End of month</button>
+                <button className={`rounded-xl px-3 py-1 text-sm ${inp.timing === 'begin' ? 'bg-teal-600 text-white' : 'bg-gray-100'}`} onClick={()=>setInp(v=>({...v, timing: 'begin'}))}>Start of month</button>
+              </div>
+            </label>
+
+            {field("Contribution Escalation (% p.a.)",
+              <input type="number" step="0.1" className="rounded-xl border p-2" value={(safeNum(inp.contribEscalationPA*100, 0)).toString()} onChange={e=>setInp(v=>({...v, contribEscalationPA: parseNum(e.target.value)/100}))} />
+            )}
+            {field("Expected Return (% p.a.)",
+              <input type="number" step="0.1" className="rounded-xl border p-2" value={(safeNum(inp.nominalReturnPA*100, 0)).toString()} onChange={e=>setInp(v=>({...v, nominalReturnPA: parseNum(e.target.value)/100}))} />
+            )}
+            {field("Inflation (CPI, % p.a.)",
+              <input type="number" step="0.1" className="rounded-xl border p-2" value={(safeNum(inp.inflationPA*100, 0)).toString()} onChange={e=>setInp(v=>({...v, inflationPA: parseNum(e.target.value)/100}))} />
+            )}
+          </div>
+        </section>
+
+        {/* Results */}
+        <section className="rounded-2xl border p-6 shadow-sm">
+          <h2 className="mb-4 text-lg font-semibold">Results</h2>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div className="rounded-xl border p-4">
+              <div className="text-xs text-gray-500">Maturity (Nominal)</div>
+              <div className="text-xl font-semibold">{fmtR0(results.projectedNominal)}</div>
+            </div>
+            <div className="rounded-xl border p-4">
+              <div className="text-xs text-gray-500">From Lump / Monthly</div>
+              <div className="text-xl font-semibold">{fmtR0(results.fvLump)} / {fmtR0(results.fvContrib)}</div>
+            </div>
+          </div>
+
+          {/* Growth chart (inside frame; end labels non-overlapping) */}
+          <div className="mt-6">
+            <h3 className="mb-2 text-sm font-medium">Growth Over Time</h3>
+            <svg width="100%" viewBox={`0 0 ${chart.w} ${chart.h}`} className="rounded-xl border bg-white">
+              <g>
+                {chart.ticks.map((t, idx) => (
+                  <g key={idx}>
+                    <line x1={56} y1={t.y} x2={chart.w - chart.rightPad} y2={t.y} stroke="#e5e7eb" />
+                    <text x={46} y={t.y} textAnchor="end" dominantBaseline="middle" fontSize="11" fill="#6B7280">{t.label}</text>
+                  </g>
+                ))}
+
+                {/* lines */}
+                <path d={chart.pathLump} fill="none" stroke="#10b981" strokeWidth="2.5" />
+                <path d={chart.pathContrib} fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeDasharray="6 4" />
+                <path d={chart.pathTotal} fill="none" stroke="#111827" strokeWidth="3" />
+
+                {/* end dots & labels */}
+                <circle cx={chart.xEnd} cy={chart.yTotal} r={4} fill="#111827" />
+                <circle cx={chart.xEnd} cy={chart.yLump} r={3} fill="#10b981" />
+                <circle cx={chart.xEnd} cy={chart.yContrib} r={3} fill="#3b82f6" />
+                <text x={chart.w - chart.rightPad + 8} y={chart.yTotal} fontSize="12" fill="#111827">Total: {fmtR0(chart.endValues.total)}</text>
+                <text x={chart.w - chart.rightPad + 8} y={chart.yLump} fontSize="12" fill="#047857">Lump: {fmtR0(chart.endValues.lump)}</text>
+                <text x={chart.w - chart.rightPad + 8} y={chart.yContrib} fontSize="12" fill="#1d4ed8">Contrib: {fmtR0(chart.endValues.contrib)}</text>
+
+                {/* x-axis ticks (0, mid, end) */}
+                {(() => {
+                  const n = results.seriesLump.length;
+                  const years = Math.max(1, Math.floor(inp.years));
+                  const midIndex = Math.round((n - 1) / 2);
+                  const tick = (i: number, label: string) => (
+                    <g key={`x${i}`}>
+                      <line x1={chart.sx(i)} y1={chart.h - chart.pad} x2={chart.sx(i)} y2={chart.h - chart.pad + 4} stroke="#9ca3af" />
+                      <text x={chart.sx(i)} y={chart.h - chart.pad + 16} textAnchor="middle" fontSize="11" fill="#6b7280">{label}</text>
+                    </g>
+                  );
+                  return (
+                    <g>
+                      {tick(0, '0y')}
+                      {tick(midIndex, `${Math.max(0, Math.floor(years / 2))}y`)}
+                      {tick(n - 1, `${years}y`)}
+                    </g>
+                  );
+                })()}
+              </g>
+            </svg>
+
+            {/* Legend */}
+            <div className="mt-2 flex items-center gap-6 text-sm">
+              <div className="flex items-center gap-2"><span className="inline-block h-2 w-6 rounded" style={{background:'#111827'}} /> <span>Total</span></div>
+              <div className="flex items-center gap-2"><span className="inline-block h-2 w-6 rounded" style={{background:'#10b981'}} /> <span>Lump</span></div>
+              <div className="flex items-center gap-2"><span className="inline-block h-2 w-6 rounded border border-dashed" style={{borderColor:'#3b82f6'}} /> <span>Contrib</span></div>
+            </div>
+          </div>
+
+          <div className="mt-6 rounded-xl bg-gray-50 p-4 text-xs text-gray-600">
+            Disclaimer: Estimates only; not financial advice. Verify SARS/FSCA rules and provider terms. Obtain POPIA consent before processing PII.
+          </div>
+        </section>
       </div>
-    </div>
-  );
-}
-
-// ---------- UI bits ----------
-function Stat({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-xl border p-4">
-      <div className="text-xs text-gray-500">{label}</div>
-      <div className="text-xl font-semibold">{children}</div>
-    </div>
-  );
-}
-
-function Percent({ value, onChange }: { value: number; onChange: (v: number) => void }) {
-  return (
-    <div className="relative">
-      <input
-        aria-label="Percentage"
-        type="number"
-        className="w-full rounded-xl border border-gray-300 p-2 pr-10 focus:outline-none focus:ring-2 focus:ring-teal-500"
-        value={Math.round((value || 0) * 10000) / 100}
-        step={0.1}
-        onChange={(e) => onChange(parseNum(e.target.value) / 100)}
-      />
-      <span className="absolute right-3 top-2.5 text-gray-500">%</span>
-    </div>
-  );
-}
-
-/** Simple SVG Line Chart (Nominal vs Real, monthly points, no external libs) */
-function LineChart({ nominal, real, years }: { nominal: number[]; real: number[]; years: number }) {
-  const width = 680,
-    height = 220,
-    pad = 28;
-  const n = Math.max(nominal.length, real.length);
-
-  const maxY = Math.max(1, ...nominal, ...real);
-  const denom = Math.max(1, n - 1);
-  const scaleX = (i: number) => pad + (i / denom) * (width - pad * 2);
-  const scaleY = (v: number) => height - pad - (v / maxY) * (height - pad * 2);
-
-  const pathFrom = (arr: number[]) => {
-    if (!arr.length) return "";
-    if (arr.length === 1) {
-      const x = scaleX(0),
-        y = scaleY(arr[0]);
-      return `M ${x} ${y} m -1,0 a 1,1 0 1,0 2,0 a 1,1 0 1,0 -2,0`;
-    }
-    let d = `M ${scaleX(0)} ${scaleY(arr[0])}`;
-    for (let i = 1; i < arr.length; i++) d += ` L ${scaleX(i)} ${scaleY(arr[i])}`;
-    return d;
-  };
-
-  const gridY: number[] = [];
-  for (let k = 0; k < 5; k++) gridY.push((k / 4) * maxY);
-
-  return (
-    <svg width="100%" viewBox={`0 0 ${width} ${height}`} className="rounded-xl border bg-white">
-      {gridY.map((gy, idx) => (
-        <g key={idx}>
-          <line x1={pad} y1={scaleY(gy)} x2={width - pad} y2={scaleY(gy)} stroke="#e5e7eb" strokeWidth="1" />
-          <text x={pad - 4} y={scaleY(gy)} textAnchor="end" dominantBaseline="middle" fontSize="10" fill="#6b7280">
-            {abbrCurrency(gy)}
-          </text>
-        </g>
-      ))}
-      <path d={pathFrom(nominal)} fill="none" stroke="#3b82f6" strokeWidth="2" />
-      <path d={pathFrom(real)} fill="none" stroke="#16a34a" strokeWidth="2" />
-      <g>
-        <rect x={pad} y={8} width="10" height="10" fill="#3b82f6" />
-        <text x={pad + 14} y={17} fontSize="11" fill="#374151">
-          Nominal
-        </text>
-        <rect x={pad + 70} y={8} width="10" height="10" fill="#16a34a" />
-        <text x={pad + 84} y={17} fontSize="11" fill="#374151">
-          Today’s R
-        </text>
-      </g>
-      {[0, Math.max(1, Math.floor(years / 2)), years].map((yr, idx) => {
-        const i = years > 0 ? Math.round((yr / years) * Math.max(0, n - 1)) : 0;
-        return (
-          <text key={idx} x={scaleX(i)} y={height - 6} textAnchor="middle" fontSize="10" fill="#6b7280">
-            {yr}y
-          </text>
-        );
-      })}
-    </svg>
-  );
-}
-
-function abbrCurrency(v: number) {
-  if (v >= 1_000_000_000) return `R ${(v / 1_000_000_000).toFixed(1)}b`;
-  if (v >= 1_000_000) return `R ${(v / 1_000_000).toFixed(1)}m`;
-  if (v >= 1_000) return `R ${(v / 1_000).toFixed(1)}k`;
-  return `R ${Math.round(v)}`;
-}
-
-/** Bar Chart (final snapshot) */
-function BarChartSnapshot({
-  required,
-  projected,
-  shortfall,
-  fromLump,
-  fromMonthly,
-  showMonthly,
-}: {
-  required: number;
-  projected: number;
-  shortfall: number;
-  fromLump: number;
-  fromMonthly: number;
-  showMonthly: boolean;
-}) {
-  const items = [
-    { label: "Required", value: required, color: "#d22b2b" },
-    { label: "Projected", value: projected, color: "#16a34a" },
-    { label: "Shortfall", value: shortfall, color: "#f59e0b" },
-    { label: "From Lump", value: fromLump, color: "#3b82f6" },
-    ...(showMonthly ? ([{ label: "From Monthly", value: fromMonthly, color: "#7c3aed" }] as const) : []),
-  ];
-  const max = Math.max(1, ...items.map((i) => i.value));
-  return (
-    <div className={`grid gap-4 ${showMonthly ? "grid-cols-5" : "grid-cols-4"}`}>
-      {items.map((it) => (
-        <div key={it.label} className="flex flex-col items-center">
-          <div className="flex h-40 w-12 items-end rounded-md bg-gray-100">
-            <div
-              className="w-full rounded-md"
-              style={{ height: `${Math.min(100, (it.value / max) * 100)}%`, backgroundColor: it.color }}
-            />
-          </div>
-          <div className="mt-2 text-center text-xs text-gray-600">
-            <div className="font-medium">{it.label}</div>
-            <div>{currency.format(Math.round(it.value))}</div>
-          </div>
-        </div>
-      ))}
     </div>
   );
 }
